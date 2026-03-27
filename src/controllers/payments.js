@@ -1,4 +1,5 @@
-import { createMpPreference } from '../config/mercadopago.js';
+import crypto from 'crypto';
+import { createMpPreference, getMpPayment } from '../config/mercadopago.js';
 import db from '../config/database.js';
 
 export const createPreference = async (req, res) => {
@@ -38,6 +39,7 @@ export const createPreference = async (req, res) => {
         email: orderData.customer.email
         // phone omitido para prevenir error 400 de formato inválido
       },
+      external_reference: orderData.id,
       back_urls: {
         success: `${baseUrl}/cart?payment=success`,
         failure: `${baseUrl}/cart?payment=failure`,
@@ -67,18 +69,68 @@ export const createPreference = async (req, res) => {
 };
 
 export const webhook = async (req, res) => {
-  // Webhook recive actualizaciones de estado (IPN) de MercadoPago
-  // https://www.mercadopago.com.co/developers/es/docs/your-integrations/notifications/webhooks
+  // Webhook recibe actualizaciones de estado (IPN) de MercadoPago
+  // Respondemos inmediatamente con HTTP 200 como pide MercadoPago
   res.status(200).send('OK');
 
   try {
-    const { action, data } = req.body;
+    const xSignature = req.headers['x-signature'];
+    const xRequestId = req.headers['x-request-id'];
+    const dataId = req.query['data.id'] || req.body?.data?.id;
+
+    if (!xSignature || !xRequestId || !dataId) {
+      console.warn('Webhook MP: Faltan headers de validación');
+      return;
+    }
+
+    // Validación HMAC
+    const parts = xSignature.split(',');
+    let ts, v1;
+    parts.forEach(part => {
+      const [key, value] = part.split('=');
+      if (key && value) {
+        if (key.trim() === 'ts') ts = value.trim();
+        if (key.trim() === 'v1') v1 = value.trim();
+      }
+    });
+
+    const secret = process.env.MP_WEBHOOK_SECRET;
+    if (secret && ts && v1) {
+      const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
+      const hmac = crypto.createHmac('sha256', secret);
+      hmac.update(manifest);
+      const sha = hmac.digest('hex');
+
+      if (sha !== v1) {
+        console.error('Webhook MP: ALERTA - Validación HMAC DENEGADA');
+        return; // IGNORAR LA PETICIÓN
+      }
+    } else {
+      console.warn('Webhook MP: No hay MP_WEBHOOK_SECRET en .env, saltando seguridad');
+    }
+
+    const { action } = req.body;
+    
     if (action === 'payment.created' || action === 'payment.updated') {
-      // 1. Obtener pago real de la API de MP usando data.id
-      // 2. Actualizar database (`payment_status`, `status`) en tabla orders
-      console.log('Webhook MP recibido:', data.id);
+      const payment = await getMpPayment(dataId);
+      
+      const externalReference = payment.external_reference;
+      const paymentStatus = payment.status; // 'approved', 'rejected', 'in_process', etc.
+      
+      if (externalReference) {
+        db.prepare('UPDATE orders SET payment_status = ?, payment_id = ? WHERE id = ?')
+          .run(paymentStatus, payment.id.toString(), externalReference);
+          
+        console.log(`Webhook MP: Orden ${externalReference} actualizada a payment_status: ${paymentStatus}`);
+      } else {
+        console.warn(`Webhook MP: Pago ${payment.id} no tiene external_reference`);
+      }
     }
   } catch (error) {
-    console.error('Webhook error:', error);
+    if (error.response) {
+      console.error('Webhook API error:', error.response);
+    } else {
+      console.error('Webhook error:', error.message);
+    }
   }
 };
