@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { createMpPreference, getMpPayment } from '../config/mercadopago.js';
 import db from '../config/database.js';
+import { sendPaymentNotificationEmail } from '../services/email.js';
 
 export const createPreference = async (req, res) => {
   try {
@@ -122,6 +123,17 @@ export const webhook = async (req, res) => {
           .run(paymentStatus, payment.id.toString(), externalReference);
           
         console.log(`Webhook MP: Orden ${externalReference} actualizada a payment_status: ${paymentStatus}`);
+
+        // Obtener detalles de la orden para el correo
+        const orderInfo = db.prepare('SELECT customer, total FROM orders WHERE id = ?').get(externalReference);
+        if (orderInfo && orderInfo.customer) {
+          try {
+            const customerData = JSON.parse(orderInfo.customer);
+            await sendPaymentNotificationEmail(externalReference, paymentStatus, customerData.name, orderInfo.total);
+          } catch (err) {
+            console.error('Error enviando notificación por correo:', err);
+          }
+        }
       } else {
         console.warn(`Webhook MP: Pago ${payment.id} no tiene external_reference`);
       }
